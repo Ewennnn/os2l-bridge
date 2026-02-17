@@ -177,6 +177,7 @@ func (b *OS2LBridge) connectToSoundSwitch() {
 		b.mu.Unlock()
 
 		b.logger.Info("SoundSwitch connection established", "ssAddr", conn.RemoteAddr().String())
+		go b.pipeSoundSwitchToVDJ()
 	}
 }
 
@@ -202,6 +203,37 @@ func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 		_, err = b.ss.Write(buf[:n])
 		if err != nil {
 			b.logger.Error("SoundSwitch disconnected", "err", err)
+
+			// Lock to edit bridge state
+			b.mu.Lock()
+			safeClose(b.ss)
+			b.ss = nil
+			b.updateIcon()
+			b.mu.Unlock()
+		}
+	}
+}
+
+func (b *OS2LBridge) pipeSoundSwitchToVDJ() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := b.ss.Read(buf)
+		if err != nil {
+			b.logger.Error("Soundswitch disconnected", "err", err)
+			b.mu.Lock()
+			b.ss = nil
+			b.updateIcon()
+			b.mu.Unlock()
+			return
+		}
+
+		if !b.isVirtualDJConnected() {
+			continue // Ignore messages
+		}
+
+		_, err = b.vdj.Write(buf[:n])
+		if err != nil {
+			b.logger.Error("VirtualDJ disconnected", "err", err)
 
 			// Lock to edit bridge state
 			b.mu.Lock()
