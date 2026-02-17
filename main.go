@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"io"
 	"log"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/getlantern/systray"
 	"github.com/grandcat/zeroconf"
 )
 
@@ -16,6 +18,20 @@ const (
 	vdjListenAddr   = ":8000"
 	soundSwitchAddr = "127.0.0.1:60594"
 )
+
+type Icon []byte
+
+//go:embed icons/icon1.ico
+var bridgeWait Icon
+
+//go:embed icons/icon2.ico
+var connectedToVirtualDJ Icon
+
+//go:embed icons/icon3.ico
+var connectedToSoundSwitch Icon
+
+//go:embed icons/icon4.ico
+var bridgeReady Icon
 
 type OS2LBridge struct {
 	logger *slog.Logger
@@ -36,12 +52,55 @@ func (b *OS2LBridge) isSoundSwitchConnected() bool {
 }
 
 func main() {
+	systray.Run(onReady, onExit)
+}
+
+func onReady() {
+	systray.SetIcon(bridgeWait)
+	systray.SetTitle("OS2L Bridge")
+	systray.SetTooltip("OS2L Bridge (VirtualDJ ↔ SoundSwitch)")
+
+	mStatus := systray.AddMenuItem("OS2L Bridge Actif", "Status")
+	mStatus.Disable()
+
+	systray.AddSeparator()
+
+	mQuit := systray.AddMenuItem("Quitter", "Fermer le bridge")
 
 	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	})
 	logger := slog.New(handler)
+	bridge := &OS2LBridge{
+		logger: logger,
+	}
 
+	go bridge.start()
+	go func() {
+		select {
+		case <-mQuit.ClickedCh:
+			systray.Quit()
+		}
+	}()
+}
+
+func onExit() {
+	// TODO exit application
+}
+
+func (b *OS2LBridge) updateIcon() {
+	if b.isVirtualDJConnected() && b.isSoundSwitchConnected() {
+		systray.SetIcon(bridgeReady)
+	} else if b.isVirtualDJConnected() {
+		systray.SetIcon(connectedToVirtualDJ)
+	} else if b.isSoundSwitchConnected() {
+		systray.SetIcon(connectedToSoundSwitch)
+	} else {
+		systray.SetIcon(bridgeWait)
+	}
+}
+
+func (b *OS2LBridge) start() {
 	// Initialize Zeroconf mDNS server
 	server, err := zeroconf.Register(
 		"OS2L-Bridge",      // Service name (used for display only)
@@ -53,16 +112,13 @@ func main() {
 	)
 
 	if err != nil {
-		logger.Error("Error on mDNS initialisation", err)
+		b.logger.Error("Error on mDNS initialisation", err)
 		return
 	}
 	defer server.Shutdown()
 
-	bridge := &OS2LBridge{
-		logger: logger,
-	}
-	go bridge.listenForVDJ()
-	go bridge.connectToSoundSwitch()
+	go b.listenForVDJ()
+	go b.connectToSoundSwitch()
 
 	select {} // Run forever
 }
@@ -90,7 +146,7 @@ func (b *OS2LBridge) listenForVDJ() {
 		}
 		b.vdj = conn
 		b.mu.Unlock()
-
+		b.updateIcon()
 		b.logger.Info("VirtualDJ connection established", "vdjAddr", conn.RemoteAddr().String())
 
 		go b.pipeVDJToSoundSwitch()
@@ -117,6 +173,7 @@ func (b *OS2LBridge) connectToSoundSwitch() {
 		// Lock to edit bridge state
 		b.mu.Lock()
 		b.ss = conn
+		b.updateIcon()
 		b.mu.Unlock()
 
 		b.logger.Info("SoundSwitch connection established", "ssAddr", conn.RemoteAddr().String())
@@ -131,6 +188,10 @@ func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 		if err != nil {
 			// Connection will be safe closed when new VirtualDJ connection established
 			b.logger.Error("VirtualDJ disconnected", "err", err)
+			b.mu.Lock()
+			b.vdj = nil
+			b.updateIcon()
+			b.mu.Unlock()
 			return
 		}
 
@@ -146,6 +207,7 @@ func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 			b.mu.Lock()
 			safeClose(b.ss)
 			b.ss = nil
+			b.updateIcon()
 			b.mu.Unlock()
 		}
 	}
