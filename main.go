@@ -246,6 +246,10 @@ func (b *OS2LBridge) pipeSoundSwitchToVDJ() {
 }
 
 func safeClose(closer io.Closer) {
+	if closer == nil {
+		return
+	}
+
 	err := closer.Close()
 	if err != nil {
 		log.Panicln("Failed to close file", err)
