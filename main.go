@@ -17,6 +17,11 @@ import (
 const (
 	vdjListenAddr   = ":8000"
 	soundSwitchAddr = "127.0.0.1:60594"
+
+	vdjConnected    = "VirtualDJ -> Connecté"
+	vdjNotConnected = "VirtualDJ -> Non connecté"
+	ssConnected     = "SoundSwitch -> Connecté"
+	ssNotConnected  = "SoundSwitch -> Non connecté"
 )
 
 type Icon []byte
@@ -37,6 +42,9 @@ type OS2LBridge struct {
 	logger *slog.Logger
 	vdj    net.Conn
 	ss     net.Conn
+
+	vdjStatus *systray.MenuItem
+	ssStatus  *systray.MenuItem
 
 	mu sync.Mutex
 }
@@ -60,8 +68,8 @@ func onReady() {
 	systray.SetTitle("OS2L Bridge")
 	systray.SetTooltip("OS2L Bridge (VirtualDJ ↔ SoundSwitch)")
 
-	mStatus := systray.AddMenuItem("OS2L Bridge Actif", "Status")
-	mStatus.Disable()
+	vdjStatus := systray.AddMenuItem(vdjNotConnected, "")
+	ssStatus := systray.AddMenuItem(ssNotConnected, "")
 
 	systray.AddSeparator()
 
@@ -72,7 +80,9 @@ func onReady() {
 	})
 	logger := slog.New(handler)
 	bridge := &OS2LBridge{
-		logger: logger,
+		logger:    logger,
+		vdjStatus: vdjStatus,
+		ssStatus:  ssStatus,
 	}
 
 	go bridge.start()
@@ -88,15 +98,23 @@ func onExit() {
 	// TODO exit application
 }
 
-func (b *OS2LBridge) updateIcon() {
+func (b *OS2LBridge) updateSystrayStatus() {
 	if b.isVirtualDJConnected() && b.isSoundSwitchConnected() {
 		systray.SetIcon(bridgeReady)
+		b.vdjStatus.SetTitle(vdjConnected)
+		b.ssStatus.SetTitle(ssConnected)
 	} else if b.isVirtualDJConnected() {
 		systray.SetIcon(connectedToVirtualDJ)
+		b.vdjStatus.SetTitle(vdjConnected)
+		b.ssStatus.SetTitle(ssNotConnected)
 	} else if b.isSoundSwitchConnected() {
 		systray.SetIcon(connectedToSoundSwitch)
+		b.vdjStatus.SetTitle(vdjNotConnected)
+		b.ssStatus.SetTitle(ssConnected)
 	} else {
 		systray.SetIcon(bridgeWait)
+		b.vdjStatus.SetTitle(vdjNotConnected)
+		b.ssStatus.SetTitle(ssNotConnected)
 	}
 }
 
@@ -146,7 +164,7 @@ func (b *OS2LBridge) listenForVDJ() {
 		}
 		b.vdj = conn
 		b.mu.Unlock()
-		b.updateIcon()
+		b.updateSystrayStatus()
 		b.logger.Info("VirtualDJ connection established", "vdjAddr", conn.RemoteAddr().String())
 
 		go b.pipeVDJToSoundSwitch()
@@ -173,7 +191,7 @@ func (b *OS2LBridge) connectToSoundSwitch() {
 		// Lock to edit bridge state
 		b.mu.Lock()
 		b.ss = conn
-		b.updateIcon()
+		b.updateSystrayStatus()
 		b.mu.Unlock()
 
 		b.logger.Info("SoundSwitch connection established", "ssAddr", conn.RemoteAddr().String())
@@ -191,7 +209,7 @@ func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 			b.logger.Error("VirtualDJ disconnected", "err", err)
 			b.mu.Lock()
 			b.vdj = nil
-			b.updateIcon()
+			b.updateSystrayStatus()
 			b.mu.Unlock()
 			return
 		}
@@ -208,7 +226,7 @@ func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 			b.mu.Lock()
 			safeClose(b.ss)
 			b.ss = nil
-			b.updateIcon()
+			b.updateSystrayStatus()
 			b.mu.Unlock()
 		}
 	}
@@ -222,7 +240,7 @@ func (b *OS2LBridge) pipeSoundSwitchToVDJ() {
 			b.logger.Error("Soundswitch disconnected", "err", err)
 			b.mu.Lock()
 			b.ss = nil
-			b.updateIcon()
+			b.updateSystrayStatus()
 			b.mu.Unlock()
 			return
 		}
@@ -239,7 +257,7 @@ func (b *OS2LBridge) pipeSoundSwitchToVDJ() {
 			b.mu.Lock()
 			safeClose(b.ss)
 			b.ss = nil
-			b.updateIcon()
+			b.updateSystrayStatus()
 			b.mu.Unlock()
 		}
 	}
