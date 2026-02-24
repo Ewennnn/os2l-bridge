@@ -60,7 +60,7 @@ func (b *OS2LBridge) isSoundSwitchConnected() bool {
 }
 
 func main() {
-	systray.Run(onReady, onExit)
+	systray.Run(onReady, func() {})
 }
 
 func onReady() {
@@ -92,10 +92,6 @@ func onReady() {
 			systray.Quit()
 		}
 	}()
-}
-
-func onExit() {
-	// TODO exit application
 }
 
 func (b *OS2LBridge) updateSystrayStatus() {
