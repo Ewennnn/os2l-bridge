@@ -2,11 +2,13 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
 	"io"
 	"log"
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -198,63 +200,90 @@ func (b *OS2LBridge) connectToSoundSwitch() {
 func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 	buf := make([]byte, 4096)
 
+	var streamBuffer strings.Builder
+
 	for {
 		n, err := b.vdj.Read(buf)
 		if err != nil {
-			// Connection will be safe closed when new VirtualDJ connection established
 			b.logger.Error("VirtualDJ disconnected", "err", err)
+
 			b.mu.Lock()
 			b.vdj = nil
 			b.updateSystrayStatus()
 			b.mu.Unlock()
+
 			return
 		}
 
-		if !b.isSoundSwitchConnected() {
-			continue // Ignore message
-		}
+		messages := splitOS2LMessages(&streamBuffer, buf[:n])
 
-		_, err = b.ss.Write(buf[:n])
-		if err != nil {
-			b.logger.Error("SoundSwitch disconnected", "err", err)
+		for _, msg := range messages {
+			// Log individual JSON message
+			b.logOS2L("VDJ -> SS", []byte(msg))
 
-			// Lock to edit bridge state
-			b.mu.Lock()
-			safeClose(b.ss)
-			b.ss = nil
-			b.updateSystrayStatus()
-			b.mu.Unlock()
+			// Always consume messages even if SS disconnected
+			if !b.isSoundSwitchConnected() {
+				continue
+			}
+
+			// Forward ONE JSON PER WRITE
+			_, err := b.ss.Write([]byte(msg + "\n"))
+			if err != nil {
+				b.logger.Error("SoundSwitch disconnected", "err", err)
+
+				b.mu.Lock()
+				safeClose(b.ss)
+				b.ss = nil
+				b.updateSystrayStatus()
+				b.mu.Unlock()
+
+				break
+			}
 		}
 	}
 }
 
 func (b *OS2LBridge) pipeSoundSwitchToVDJ() {
 	buf := make([]byte, 4096)
+
+	var streamBuffer strings.Builder
+
 	for {
 		n, err := b.ss.Read(buf)
 		if err != nil {
-			b.logger.Error("Soundswitch disconnected", "err", err)
+			b.logger.Error("SoundSwitch disconnected", "err", err)
+
 			b.mu.Lock()
 			b.ss = nil
 			b.updateSystrayStatus()
 			b.mu.Unlock()
+
 			return
 		}
 
-		if !b.isVirtualDJConnected() {
-			continue // Ignore messages
-		}
+		messages := splitOS2LMessages(&streamBuffer, buf[:n])
 
-		_, err = b.vdj.Write(buf[:n])
-		if err != nil {
-			b.logger.Error("VirtualDJ disconnected", "err", err)
+		for _, msg := range messages {
+			// Log individual JSON message
+			b.logOS2L("SS -> VDJ", []byte(msg))
 
-			// Lock to edit bridge state
-			b.mu.Lock()
-			safeClose(b.ss)
-			b.ss = nil
-			b.updateSystrayStatus()
-			b.mu.Unlock()
+			if !b.isVirtualDJConnected() {
+				continue
+			}
+
+			// Forward ONE JSON PER WRITE
+			_, err := b.vdj.Write([]byte(msg + "\n"))
+			if err != nil {
+				b.logger.Error("VirtualDJ disconnected", "err", err)
+
+				b.mu.Lock()
+				safeClose(b.vdj)
+				b.vdj = nil
+				b.updateSystrayStatus()
+				b.mu.Unlock()
+
+				break
+			}
 		}
 	}
 }
@@ -268,4 +297,103 @@ func safeClose(closer io.Closer) {
 	if err != nil {
 		log.Panicln("Failed to close file", err)
 	}
+}
+
+func (b *OS2LBridge) logOS2L(direction string, msg []byte) {
+	if len(msg) == 0 {
+		return
+	}
+
+	clean := sanitizeJSON(string(msg))
+
+	if json.Valid([]byte(clean)) {
+		var obj any
+		if err := json.Unmarshal([]byte(clean), &obj); err == nil {
+			pretty, _ := json.Marshal(obj)
+
+			b.logger.Info(
+				"OS2L message",
+				"direction", direction,
+				"json", string(pretty),
+			)
+			return
+		}
+	}
+
+	// fallback si JSON invalide
+	b.logger.Warn(
+		"OS2L raw message",
+		"direction", direction,
+		"data", clean,
+	)
+}
+
+func sanitizeJSON(s string) string {
+	return strings.TrimSpace(
+		strings.ReplaceAll(
+			strings.ReplaceAll(s, "\n", ""),
+			"\r",
+			"",
+		),
+	)
+}
+
+func splitOS2LMessages(buffer *strings.Builder, incoming []byte) []string {
+	buffer.Write(incoming)
+
+	data := buffer.String()
+
+	var (
+		messages []string
+		current  []rune
+
+		depth    int
+		inString bool
+		escaped  bool
+	)
+
+	for _, r := range data {
+		current = append(current, r)
+
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		switch r {
+		case '\\':
+			if inString {
+				escaped = true
+			}
+
+		case '"':
+			inString = !inString
+
+		case '{':
+			if !inString {
+				depth++
+			}
+
+		case '}':
+			if !inString {
+				depth--
+
+				// Complete JSON object detected
+				if depth == 0 {
+					msg := strings.TrimSpace(string(current))
+					if msg != "" {
+						messages = append(messages, msg)
+					}
+
+					current = current[:0]
+				}
+			}
+		}
+	}
+
+	// Keep incomplete fragment for next TCP read
+	buffer.Reset()
+	buffer.WriteString(string(current))
+
+	return messages
 }
