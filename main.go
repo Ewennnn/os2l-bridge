@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	_ "embed"
-	"encoding/json"
 	"io"
 	"log"
 	"log/slog"
@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -48,7 +49,9 @@ type OS2LBridge struct {
 	vdjStatus *systray.MenuItem
 	ssStatus  *systray.MenuItem
 
-	mu sync.Mutex
+	mu    sync.Mutex
+	state *BridgeState
+	ui    *UIRenderer
 }
 
 // Mutex must be used before and after call this function
@@ -77,17 +80,25 @@ func onReady() {
 
 	mQuit := systray.AddMenuItem("Quitter", "Fermer le bridge")
 
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+	// Simple logger without file output
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
 	})
 	logger := slog.New(handler)
+
+	state := NewBridgeState()
+	ui := NewUIRenderer(state)
+
 	bridge := &OS2LBridge{
 		logger:    logger,
 		vdjStatus: vdjStatus,
 		ssStatus:  ssStatus,
+		state:     state,
+		ui:        ui,
 	}
 
 	go bridge.start()
+	go bridge.updateUIDisplay()
 	go func() {
 		select {
 		case <-mQuit.ClickedCh:
@@ -116,8 +127,18 @@ func (b *OS2LBridge) updateSystrayStatus() {
 	}
 }
 
+// updateUIDisplay updates the terminal UI display every second
+func (b *OS2LBridge) updateUIDisplay() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		b.ui.RenderStatus()
+	}
+}
+
 func (b *OS2LBridge) start() {
-	// Initialize Zeroconf mDNS server
+	// Initialize Zeroconf mDNS server (optional - continues if it fails)
 	server, err := zeroconf.Register(
 		"OS2L-Bridge",      // Service name (used for display only)
 		"_os2l._tcp",       // Service type & protocol (needed and strict : https://os2l.org/)
@@ -128,10 +149,11 @@ func (b *OS2LBridge) start() {
 	)
 
 	if err != nil {
-		b.logger.Error("Error on mDNS initialisation", err)
-		return
+		// mDNS registration failed, but we can continue without it
+		b.logger.Warn("mDNS registration failed (this is optional)", "err", err)
+	} else {
+		defer server.Shutdown()
 	}
-	defer server.Shutdown()
 
 	go b.listenForVDJ()
 	go b.connectToSoundSwitch()
@@ -140,7 +162,11 @@ func (b *OS2LBridge) start() {
 }
 
 func (b *OS2LBridge) listenForVDJ() {
-	listener, err := net.Listen("tcp", vdjListenAddr)
+	lc := net.ListenConfig{
+		Control: reuseAddr,
+	}
+
+	listener, err := lc.Listen(context.Background(), "tcp", vdjListenAddr)
 	if err != nil {
 		b.logger.Error("Error on VDJ connection initialisation", "err", err)
 		os.Exit(1)
@@ -161,6 +187,7 @@ func (b *OS2LBridge) listenForVDJ() {
 			safeClose(b.vdj)
 		}
 		b.vdj = conn
+		b.state.VDJConnected.Store(true)
 		b.mu.Unlock()
 		b.updateSystrayStatus()
 		b.logger.Info("VirtualDJ connection established", "vdjAddr", conn.RemoteAddr().String())
@@ -189,8 +216,11 @@ func (b *OS2LBridge) connectToSoundSwitch() {
 		// Lock to edit bridge state
 		b.mu.Lock()
 		b.ss = conn
-		b.updateSystrayStatus()
+		b.state.SSConnected.Store(true)
+		b.state.SSSubscribeCount.Store(0)
+		b.state.SSSubscribed.Store(false)
 		b.mu.Unlock()
+		b.updateSystrayStatus()
 
 		b.logger.Info("SoundSwitch connection established", "ssAddr", conn.RemoteAddr().String())
 		go b.pipeSoundSwitchToVDJ()
@@ -209,6 +239,7 @@ func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 
 			b.mu.Lock()
 			b.vdj = nil
+			b.state.VDJConnected.Store(false)
 			b.updateSystrayStatus()
 			b.mu.Unlock()
 
@@ -218,8 +249,8 @@ func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 		messages := splitOS2LMessages(&streamBuffer, buf[:n])
 
 		for _, msg := range messages {
-			// Log individual JSON message
-			b.logOS2L("VDJ -> SS", []byte(msg))
+			// Update state with OS2L message (non-blocking)
+			b.state.UpdateFromOS2LMessage("VDJ -> SS", msg)
 
 			// Always consume messages even if SS disconnected
 			if !b.isSoundSwitchConnected() {
@@ -234,6 +265,8 @@ func (b *OS2LBridge) pipeVDJToSoundSwitch() {
 				b.mu.Lock()
 				safeClose(b.ss)
 				b.ss = nil
+				b.state.SSConnected.Store(false)
+				b.state.SSSubscribed.Store(false)
 				b.updateSystrayStatus()
 				b.mu.Unlock()
 
@@ -255,6 +288,8 @@ func (b *OS2LBridge) pipeSoundSwitchToVDJ() {
 
 			b.mu.Lock()
 			b.ss = nil
+			b.state.SSConnected.Store(false)
+			b.state.SSSubscribed.Store(false)
 			b.updateSystrayStatus()
 			b.mu.Unlock()
 
@@ -264,8 +299,8 @@ func (b *OS2LBridge) pipeSoundSwitchToVDJ() {
 		messages := splitOS2LMessages(&streamBuffer, buf[:n])
 
 		for _, msg := range messages {
-			// Log individual JSON message
-			b.logOS2L("SS -> VDJ", []byte(msg))
+			// Update state with OS2L message (non-blocking)
+			b.state.UpdateFromOS2LMessage("SS -> VDJ", msg)
 
 			if !b.isVirtualDJConnected() {
 				continue
@@ -279,6 +314,7 @@ func (b *OS2LBridge) pipeSoundSwitchToVDJ() {
 				b.mu.Lock()
 				safeClose(b.vdj)
 				b.vdj = nil
+				b.state.VDJConnected.Store(false)
 				b.updateSystrayStatus()
 				b.mu.Unlock()
 
@@ -297,45 +333,6 @@ func safeClose(closer io.Closer) {
 	if err != nil {
 		log.Panicln("Failed to close file", err)
 	}
-}
-
-func (b *OS2LBridge) logOS2L(direction string, msg []byte) {
-	if len(msg) == 0 {
-		return
-	}
-
-	clean := sanitizeJSON(string(msg))
-
-	if json.Valid([]byte(clean)) {
-		var obj any
-		if err := json.Unmarshal([]byte(clean), &obj); err == nil {
-			pretty, _ := json.Marshal(obj)
-
-			b.logger.Info(
-				"OS2L message",
-				"direction", direction,
-				"json", string(pretty),
-			)
-			return
-		}
-	}
-
-	// fallback si JSON invalide
-	b.logger.Warn(
-		"OS2L raw message",
-		"direction", direction,
-		"data", clean,
-	)
-}
-
-func sanitizeJSON(s string) string {
-	return strings.TrimSpace(
-		strings.ReplaceAll(
-			strings.ReplaceAll(s, "\n", ""),
-			"\r",
-			"",
-		),
-	)
 }
 
 func splitOS2LMessages(buffer *strings.Builder, incoming []byte) []string {
@@ -396,4 +393,15 @@ func splitOS2LMessages(buffer *strings.Builder, incoming []byte) []string {
 	buffer.WriteString(string(current))
 
 	return messages
+}
+
+// reuseAddr sets SO_REUSEADDR on the listener socket
+func reuseAddr(network, address string, c syscall.RawConn) error {
+	var opErr error
+	if err := c.Control(func(fd uintptr) {
+		opErr = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	}); err != nil {
+		return err
+	}
+	return opErr
 }
